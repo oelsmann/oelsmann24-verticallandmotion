@@ -7,12 +7,11 @@ This module contains the vertical land motion module from the GlobalVLM workflow
 
 ## Example
 
-Clone repo, download and organize input data:
+Download and organize input data:
 > [!WARNING]
 > The following command will download 8 GB of data.
 
 ```shell
-git clone --single-branch --branch package git@github.com:e-marshall/oelsmann24-verticallandmotion.git
 
 #Download input data
 mkdir -p ./data/input
@@ -30,7 +29,7 @@ Run the application in a container, such as:
 docker run --rm \
 -v ./data/input:/mnt/oelsmann24_in:ro \
 -v ./data/output:/mnt/oelsmann24_out \
-oelsmann24-verticallandmotion \
+ghcr.io/fact-sealevel/oelsmann24-verticallandmotion:latest \
 --pipeline-id "1234" \
 --nsamps 500 \
 --input-vlm-reconstruction-file "/mnt/oelsmann24_in/VLM_reconstruction.nc" \
