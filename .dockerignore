@@ -36,5 +36,7 @@ coverage.xml
 Dockerfile
 .env
 data
+diagnostics
+AGENTS.md
 .history
 .vscode

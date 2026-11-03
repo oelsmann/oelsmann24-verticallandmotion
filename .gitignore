@@ -184,3 +184,6 @@ cython_debug/
 .vscode 
 
 data/
+
+# Local Codex project guidance; do not include in upstream contributions.
+AGENTS.md
