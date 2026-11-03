@@ -1,230 +1,191 @@
-import numpy as np
-import xarray as xr
-import argparse
-from oelsmann24_verticallandmotion.read_locationfile import ReadLocationFile
-from scipy.spatial import cKDTree
-from scipy.interpolate import interp1d
-from scipy.stats import norm
+"""Project the observation/GIA contribution to RSL using integrated velocity weights."""
+
+import os
+from pathlib import Path
+import tempfile
 import time
 
+from netCDF4 import Dataset
+import numpy as np
+from scipy.interpolate import interp1d
+from scipy.spatial import cKDTree
+from scipy.stats import norm
 
-""" vlm_preprocess.py
+from .read_locationfile import ReadLocationFile
+from .vlm_preprocess import _to_xyz, _arc_km_from_chord
 
-This runs the projection stage for the global vertical land motion component.
-
-Parameters:
-nsamps = Number of samples to draw
-rng_seed = Seed value for the random number generator
-locationfilename = File that contains points for localization
-pipeline_id = Unique identifier for the pipeline running this code
-
-"""
+VLM_RATE_MODES = ("converge-to-gia", "constant")
 
 
 def match_coord_vectors(site_lats, site_lons, lat_flat, lon_flat):
+    """Nearest grid node on a sphere, accepting either longitude convention."""
+    if len(lat_flat) == 0:
+        raise ValueError("Cannot map onto an empty grid")
+    tree = cKDTree(_to_xyz(lon_flat, lat_flat))
+    chord, idx = tree.query(_to_xyz(site_lons, site_lats))
+    return idx, _arc_km_from_chord(chord)
+
+
+def projection_years(baseyear, start, end, step):
+    """Exact integer step; end is included only when it falls on that step."""
+    if any(
+        isinstance(v, bool) or not isinstance(v, (int, np.integer))
+        for v in [baseyear, start, end, step]
+    ):
+        raise ValueError("Projection years and step must be integers")
+    if not 2000 <= baseyear <= 2300 or not 2000 <= start <= end <= 2300:
+        raise ValueError(
+            "Base and projection years must be in 2000..2300; start <= end"
+        )
+    if step < 1:
+        raise ValueError("Projection year step must be positive")
+    return np.arange(start, end + 1, step, dtype=np.int64)
+
+
+def temp_decay(years, start_year=None, period1=2050, period2=2150):
+    """Calendar-fixed cosine velocity weight, independent of requested year range."""
+    if period2 <= period1:
+        raise ValueError("Decay end must follow decay start")
+    years = np.asarray(years, dtype=float)
+    offset = np.clip(years - period1, 0, period2 - period1)
+    weight = (1 + np.cos(np.pi * offset / (period2 - period1))) / 2
+    inside = (years >= period1) & (years < period2)
+    return weight[inside], years[inside] - period1, weight
+
+
+def integrated_decay(years, baseyear, period1=2050, period2=2150):
+    """Exact integral of the cosine velocity taper from baseyear to each year."""
+    if period2 <= period1:
+        raise ValueError("Decay end must follow decay start")
+    duration = period2 - period1
+
+    def primitive(y):
+        y = np.asarray(y, dtype=float)
+        q = np.clip(y - period1, 0, duration)
+        return (
+            np.minimum(y, period1)
+            + q / 2
+            + duration / (2 * np.pi) * np.sin(np.pi * q / duration)
+        )
+
+    return primitive(years) - primitive(baseyear)
+
+
+def _grw_at_years(grw, source_ids, years):
+    """Use actual years; leading pre-projection NaNs are structural zeros.
+
+    Internal/trailing missing values are rejected. No extrapolation is allowed
+    while the observational contribution is active; outside it the result is zero.
     """
-    Match site coordinates to nearest grid points on a sphere.
-
-    Parameters
-    ----------
-    site_lats, site_lons : array-like, shape (M,)
-        Site latitudes/longitudes (deg).
-    lat_flat, lon_flat   : array-like, shape (N,)
-        Flattened grid lat/lon (deg), typically from 2D meshgrid.ravel().
-
-    Returns
-    -------
-    idx : np.ndarray, shape (M,)
-        Indices into (lat_flat, lon_flat) for the nearest grid point to each site.
-    dist_km : np.ndarray, shape (M,)
-        Great-circle distance (km) from each site to its matched grid point.
-    """
-
-    def sph2cart(lat_deg, lon_deg):
-        lat = np.deg2rad(lat_deg)
-        lon = np.deg2rad(lon_deg)
-        coslat = np.cos(lat)
-        x = coslat * np.cos(lon)
-        y = coslat * np.sin(lon)
-        z = np.sin(lat)
-        return np.column_stack((x, y, z))
-
-    # build tree from flattened grid points
-    pts = sph2cart(lat_flat, lon_flat)  # shape (N,3)
-    tree = cKDTree(pts)
-
-    # convert sites and query
-    sites = sph2cart(site_lats, site_lons)  # shape (M,3)
-    d_euclid, idx = tree.query(sites, k=1)  # d_euclid = chord distances
-
-    # convert to great-circle distance (using dot-product is numerically stable)
-    # get the matched points' unit vectors
-    matched = pts[idx]  # shape (M,3)
-    dot = np.einsum("ij,ij->i", matched, sites)  # dot = cos(angle)
-    dot = np.clip(dot, -1.0, 1.0)
-    angle_rad = np.arccos(dot)  # central angle (radians)
-
-    EARTH_KM = 6371.0
-    dist_km = EARTH_KM * angle_rad
-
-    # results:
-    # idx      -> indices into lat_flat/lon_flat nearest to each site
-    # dist_km  -> great-circle distance in km for each site
-    return idx, dist_km
+    if not np.any(source_ids >= 0):
+        return np.zeros((len(source_ids), len(years)))
+    if set(grw.dims) != {"x", "time"}:
+        raise ValueError("GRW_ensemble_std must have x and time dimensions")
+    t = grw.time
+    source_years = (
+        t.dt.year.values
+        if np.issubdtype(t.dtype, np.datetime64) or t.dtype.kind == "O"
+        else np.asarray(t, dtype=float)
+    )
+    if (
+        len(source_years) < 2
+        or not np.all(np.isfinite(source_years))
+        or np.any(np.diff(source_years) <= 0)
+        or np.min(source_years) < 1800
+    ):
+        raise ValueError(
+            "GRW time must contain increasing, unique absolute calendar years"
+        )
+    valid_sites = source_ids >= 0
+    unique, inverse = np.unique(source_ids[valid_sites], return_inverse=True)
+    values = grw.transpose("x", "time").isel(x=unique).values.astype(float)
+    if np.any(values[np.isfinite(values)] < 0):
+        raise ValueError("GRW standard deviations cannot be negative")
+    for row in values:
+        finite = np.flatnonzero(np.isfinite(row))
+        if not len(finite):
+            raise ValueError("GRW source has no finite standard deviations")
+        row[: finite[0]] = 0
+        if not np.all(np.isfinite(row)):
+            raise ValueError("GRW has internal or trailing missing values")
+    years = np.asarray(years, dtype=float)
+    active = temp_decay(years)[2] > 0
+    if np.any((years[active] < source_years[0]) | (years[active] > source_years[-1])):
+        raise ValueError("Requested active GRW years exceed source time coverage")
+    result = np.zeros((len(source_ids), len(years)))
+    if np.any(active):
+        f = interp1d(source_years, values, axis=1, bounds_error=True)
+        result[np.ix_(valid_sites, active)] = f(years[active])[inverse]
+    return result * 1000  # Input displacement spread in m; output mm.
 
 
-def map_datasets_on_locationfile(
-    dis_sel_2d,
-    GIA_VLM_int,
-    dis_sel_2d_grw_use,
-    decay_vec_vlm,
+def projection_parameters(
+    preprocess_dict,
     site_lats,
     site_lons,
-    targyears,
+    years,
     baseyear,
+    rate_mode="converge-to-gia",
+    gia_only=False,
 ):
+    """Return site/year mean and three independent uncertainty coefficients.
+
+    GIA sea-surface mean is retained in the observational branch. Its covariance
+    with GIA radial deformation is unavailable; no new uncertainty model for that
+    correction is invented here. Spatial and GRW path covariance remain simplified.
+    rate_mode controls secular velocity and trend uncertainty only; the existing
+    GRW displacement-envelope taper is unchanged in both modes.
+    gia_only bypasses observational fields and uses the full GIA RSL rate/error.
     """
-    Map gridded VLM/GIA fields to site locations and time grid.
+    if rate_mode not in VLM_RATE_MODES:
+        raise ValueError(f"rate_mode must be one of {VLM_RATE_MODES}")
+    gia = preprocess_dict["GIA_VLM_int"]
+    fields = gia if gia_only else preprocess_dict["VLM_REC_MERGED"]
+    xx, yy = np.meshgrid(fields.lon, fields.lat)
+    idx, _ = match_coord_vectors(site_lats, site_lons, yy.ravel(), xx.ravel())
 
-    Parameters
-    ----------
-    dis_sel_2d : xr.Dataset
-        Contains VLM trend/uncertainty on a (lat, lon) grid.
-    GIA_VLM_int : xr.Dataset
-        GIA fields on the same (lat, lon) grid. Must contain 'rsl_mean' and 'rsl_sterr'.
-    dis_sel_2d_grw_use : xr.Dataset
-        GRW ensemble std over (lat, lon, time) used to mimic present-day variability.
-    decay_vec_vlm : np.ndarray
-        Spatial-temporal weights (lat, lon, time) for blending; will be reshaped.
-    site_lats, site_lons : array-like
-        Site coordinates (deg).
-    targyears : array-like
-        Target projection years (absolute years).
-    baseyear : int
-        Base/reference year.
+    def take(da):
+        return da.transpose("lat", "lon").values.ravel()[idx]
 
-    Returns
-    -------
-    tuple of arrays:
-        VLM_REC_trend_mapped                : (M,)   VLM→RSL trend at sites (mm/yr → mm after time mult)
-        VLM_REC_trend_un_mapped             : (M,)   Uncertainty of VLM trend (mm/yr)
-        VLM_GRW_trend_un_mapped             : (M,T5) Original GRW (5-year steps) mapped to sites (mm/yr)
-        GIA_VLM_int_rsl_mean_mapped         : (M,)   GIA mean RSL trend (mm/yr)
-        GIA_VLM_int_rsl_sterr_mapped        : (M,)   GIA sterr (mm/yr)
-        VLM_GRW_trend_un_mapped_interp      : (M,Y)  GRW interpolated to targyears (mm/yr)
-        WEIGHTS                              : (M,Y)  Time-dependent weights for each site
+    dt = np.asarray(years, dtype=float) - baseyear
+    if gia_only:
+        mean = dt[:, None] * take(gia.rsl_mean)
+        gia_sigma = dt[:, None] * take(gia.rsl_sterr)
+        zeros = np.zeros_like(mean)
+        return mean, zeros, zeros.copy(), gia_sigma
 
-    Notes
-    -----
-    - VLM trend to RSL: uses `VLM_trend_coefficient_mean` (mm/yr) * (-1) + `GIA_VLM_int['asl']`.
-    - GRW time axis is originally in 5-year steps; interpolated to `targyears`.
-    - `decay_vec_vlm` is reshaped to (Npoints, Ny) then indexed by nearest-neighbor mapping.
-    """
-
-    # flatten datasets
-    # VLM (GPS and reconstruction) trends + uncertainties
-    VLM_REC_trend = (
-        dis_sel_2d["VLM_trend_coefficient_mean"].fillna(0).values * 1000 * -1
-        + GIA_VLM_int["asl"].values
-    ).flatten()  # impact on RSL
-    VLM_REC_trend_un = (
-        dis_sel_2d["VLM_trend_coefficient_uncertainty"].fillna(0).values * 1000
-    ).flatten()
-
-    # dis_sel_2d_grw_use_matrix = dis_sel_2d_grw_use[:,:,:31]*decay_vec_vlm*1000.
-    # VLM (GPS and reconstruction) GRW
-    dim0, dim1, dim2 = dis_sel_2d_grw_use.dims
-    VLM_GRW_trend_un = (
-        dis_sel_2d_grw_use.stack(points=(dim0, dim1)).T.values[:, 1:] * 1000.0
+    spatial_weight = take(preprocess_dict["weights"])
+    trend = take(fields.VLM_trend_coefficient_mean) * 1000
+    sigma = take(fields.VLM_trend_coefficient_uncertainty) * 1000
+    if np.any(
+        (spatial_weight > 0) & (~np.isfinite(trend) | ~np.isfinite(sigma) | (sigma < 0))
+    ):
+        raise ValueError("Observation trend or uncertainty missing at a weighted site")
+    trend = np.where(spatial_weight > 0, trend, 0)
+    sigma = np.where(spatial_weight > 0, sigma, 0)
+    duration = (
+        integrated_decay(years, baseyear) if rate_mode == "converge-to-gia" else dt
     )
-
-    # VLM (GIA) trends + uncertainties
-    GIA_VLM_int_rsl_mean = GIA_VLM_int["rsl_mean"].values.flatten()
-    GIA_VLM_int_rsl_sterr = GIA_VLM_int["rsl_sterr"].values.flatten()
-
-    # Interpolate
-    lat1d = dis_sel_2d["lat"].values  # shape (720,)
-    lon1d = dis_sel_2d["lon"].values  # shape (1440,)
-
-    lon2d, lat2d = np.meshgrid(lon1d, lat1d)  # lon varies fastest in each row
-
-    lat_flat = lat2d.ravel()  # length = 720*1440
-    lon_flat = lon2d.ravel()
-
-    idx, dist_km = match_coord_vectors(site_lats, site_lons, lat_flat, lon_flat)
-
-    VLM_REC_trend_mapped = VLM_REC_trend[idx]
-    VLM_REC_trend_un_mapped = VLM_REC_trend_un[idx]
-    VLM_GRW_trend_un_mapped = VLM_GRW_trend_un[
-        idx, :
-    ]  # currently contains 60 timesteps, with 5 year stepsize
-    GIA_VLM_int_rsl_mean_mapped = GIA_VLM_int_rsl_mean[idx]
-    GIA_VLM_int_rsl_sterr_mapped = GIA_VLM_int_rsl_sterr[idx]
-    n0, n1, n2 = decay_vec_vlm.shape
-    WEIGHTS = decay_vec_vlm.reshape(n0 * n1, n2)[idx, :]
-    # interpolate GRW timesteps on the new time vector
-
-    arr = np.asarray(VLM_GRW_trend_un_mapped)  # shape (nspace, nt)
-    nspace, nt = arr.shape
-
-    orig_years = baseyear + np.arange(nt) * 5  # shape (nt,)
-
-    # create interpolator along time axis (axis=1), allow extrapolation
-    f = interp1d(
-        orig_years,
-        arr,
-        axis=1,
-        kind="linear",
-        bounds_error=False,
-        fill_value="extrapolate",
-        assume_sorted=True,
-    )
-
-    VLM_GRW_trend_un_mapped_interp = f(targyears)  # shape (nspace, ny)
-
-    return (
-        VLM_REC_trend_mapped,
-        VLM_REC_trend_un_mapped,
-        VLM_GRW_trend_un_mapped,
-        GIA_VLM_int_rsl_mean_mapped,
-        GIA_VLM_int_rsl_sterr_mapped,
-        VLM_GRW_trend_un_mapped_interp,
-        WEIGHTS,
-    )
+    obs_duration = duration[:, None] * spatial_weight[None, :]
+    gia_duration = dt[:, None] - obs_duration
+    mean = obs_duration * (-trend + take(gia.asl)) + gia_duration * take(gia.rsl_mean)
+    obs_sigma = obs_duration * sigma
+    gia_sigma = gia_duration * take(gia.rsl_sterr)
+    ids = take(fields.source_index).astype(int)
+    eval_years = np.concatenate([np.asarray(years), [baseyear]])
+    grw = _grw_at_years(preprocess_dict["VLM_REC_MERGED_GRW"], ids, eval_years)
+    # This displacement envelope, not a velocity, is referenced consistently to b.
+    envelope = grw * temp_decay(eval_years)[2][None, :]
+    grw_sigma = spatial_weight[None, :] * (envelope[:, :-1] - envelope[:, -1:]).T
+    return mean, obs_sigma, grw_sigma, gia_sigma
 
 
-def temp_decay(years, start_year, period1=2050, period2=2150):
-    """
-    Time-decay function blending VLM observations into GIA VLM trends.
-
-    Parameters
-    ----------
-    years : array-like
-        Absolute years (same grid as target years).
-    start_year : int
-        (Unused in current implementation; kept for signature stability)
-    period1, period2 : int
-        Blend window; cosine taper from 1 → 0 between [period1, period2].
-
-    Returns
-    -------
-    decay_period_y : np.ndarray
-        Cosine taper values during the blend window.
-    decay_period_x : np.ndarray
-        Years offset within the blend window (0..period2-period1).
-    decay_vec : np.ndarray, shape (len(years),)
-        Full time series of weights (1 before, cosine taper inside, 0 after).
-
-    """
-    decay_vec = np.ones(len(years))
-    decay_period_x = years[(years >= period1) & (years < period2)]
-    decay_period_x = decay_period_x - decay_period_x[0]
-    decay_period_y = (
-        np.cos(decay_period_x * 2 * np.pi / (2 * (period2 - period1))) + 1
-    ) / 2
-    decay_vec[(years >= period1) & (years < period2)] = decay_period_y
-    decay_vec[years >= period2] = 0
-    return decay_period_y, decay_period_x, decay_vec
+def sample_draws(nsamps, seed):
+    """Independent stratified Gaussian streams, stable across chunk sizes."""
+    if nsamps < 1 or seed < 0:
+        raise ValueError("nsamps must be positive and seed nonnegative")
+    q = norm.ppf(np.arange(1, nsamps + 1) / (nsamps + 1))
+    return tuple(np.random.default_rng(seed + i).permutation(q) for i in range(3))
 
 
 def vlm_postprocess(
@@ -239,279 +200,87 @@ def vlm_postprocess(
     chunksize,
     pipeline_id,
     output_lslr_file: str,
+    rate_mode="converge-to-gia",
+    gia_only=False,
 ):
-    """
-    Run the VLM post-processing to produce local sea-level change samples.
-
-    Steps
-    -----
-    1) Load `<pipeline_id>_data.pkl` (produced by preprocess stage)
-    2) Read location file (ids, lats, lons) using `ReadLocationFile`
-    3) Build target year vector; compute time-decay weights
-    4) Map VLM & GIA fields to sites; interpolate GRW to target years
-    5) Draw samples and construct (samples, years, locations) array
-    6) Write NetCDF: `<pipeline_id>_localsl.nc`
-
-    Outputs
-    -------
-    NetCDF file with variables:
-      - sea_level_change[samples, years, locations] (mm)
-      - lat[locations], lon[locations]
-      - coords: years, locations, samples
-
-    Notes
-    -----
-    - Uses two random permutations of inverse-normal quantiles for stratified sampling.
-    - `ReadLocationFile` must return a tuple (_, site_ids, site_lats, site_lons).
-    """
-    # Read in the data from the preprocessing stage
-    # datafile = "{}_data.pkl".format(pipeline_id)
-    # try:
-    #    f = open(datafile, 'rb')
-    # except:
-    #    print("Cannot open datafile\n")
-    #    sys.exit(1)
-
-    # Extract the data from the file
-    # my_data = p.load(f)
-    GIA_VLM_int = preprocess_dict["GIA_VLM_int"]
-    VLM_REC_MERGED = preprocess_dict["VLM_REC_MERGED"]
-    VLM_REC_MERGED_GRW = preprocess_dict["VLM_REC_MERGED_GRW"]
-    weights = preprocess_dict["weights"]
-    # f.close()
-
-    (_, site_ids, site_lats, site_lons) = ReadLocationFile(location_file)
-
-    targyears = np.linspace(
-        pyear_start, pyear_end, int((pyear_end - pyear_start) / pyear_step) + 1
-    )
-    # targyears excludes baseyear here
-
-    decay__period_y, decay_period_x, decay_vec = temp_decay(
-        targyears, pyear_start, period1=2050, period2=2150
-    )
-
-    # contains spatial and temporal weights to merge GIA and the other VLM observations
-    decay_vec_vlm = decay_vec * weights.values[:, :, None]
-    # decay_vec_gia = (((decay_vec * w_d.values[:,:,None])*-1)+1)
-
-    (
-        VLM_REC_trend_mapped,
-        VLM_REC_trend_un_mapped,
-        VLM_GRW_trend_un_mapped,
-        GIA_VLM_int_rsl_mean_mapped,
-        GIA_VLM_int_rsl_sterr_mapped,
-        VLM_GRW_trend_un_mapped_interp,
-        WEIGHTS,
-    ) = map_datasets_on_locationfile(
-        VLM_REC_MERGED,
-        GIA_VLM_int,
-        VLM_REC_MERGED_GRW,
-        decay_vec_vlm,
-        site_lats,
-        site_lons,
-        targyears,
+    """Stream floating-point RSL samples to the established FACTS NetCDF schema."""
+    years = projection_years(baseyear, pyear_start, pyear_end, pyear_step)
+    if chunksize < 1:
+        raise ValueError("chunk-size must be positive")
+    draws = sample_draws(nsamps, rng_seed)
+    _, ids, lats, lons = ReadLocationFile(location_file)
+    coefficients = projection_parameters(
+        preprocess_dict,
+        lats,
+        lons,
+        years,
         baseyear,
+        rate_mode=rate_mode,
+        gia_only=gia_only,
     )
-
-    # Generate Samples
-    rng = np.random.default_rng(rng_seed)
-    rng2 = np.random.default_rng(rng_seed + 1)
-    x = np.linspace(0, 1, nsamps + 2)[1 : (nsamps + 1)]
-    norm_inv = norm.ppf(x)
-    norm_inv_perm = rng.permutation(norm_inv).astype(np.float32)
-    norm_inv_perm2 = rng2.permutation(norm_inv).astype(np.float32)
-    nc_missing_value = np.nan  # np.iinfo(np.int16).min
-
-    # Project
-    years_mult = targyears - baseyear
-    VLM_REC_trend_mapped_time = np.multiply.outer(years_mult, VLM_REC_trend_mapped)
-    VLM_REC_trend_un_mapped_time = np.multiply.outer(
-        years_mult, VLM_REC_trend_un_mapped
+    if not all(np.all(np.isfinite(a)) for a in coefficients):
+        raise ValueError("Projection contains missing or nonfinite coefficients")
+    output = Path(output_lslr_file)
+    location_block = min(len(ids), 1024)
+    # Bound arithmetic memory even when the requested sample batch is very large.
+    sample_block = min(
+        chunksize, nsamps, max(1, 64 * 1024**2 // (len(years) * location_block * 8 * 5))
     )
-    GIA_VLM_int_rsl_mean_mapped_time = np.multiply.outer(
-        years_mult, GIA_VLM_int_rsl_mean_mapped
-    )
-    GIA_VLM_int_rsl_sterr_mapped_time = np.multiply.outer(
-        years_mult, GIA_VLM_int_rsl_sterr_mapped
-    )
-
-    sample_shape = VLM_REC_trend_mapped_time.shape  # (H, W)
-    SAMPLES = np.empty((nsamps,) + sample_shape, dtype=np.int16)  # *np.nan
-    # SAMPLES = np.zeros((nsamps,) + sample_shape, dtype=np.int16)
-
-    # Precompute / cast to float32 to reduce memory & speed up arithmetic
-    VLM_REC_trend_mapped_time_ = VLM_REC_trend_mapped_time.astype(np.float32)
-    VLM_REC_trend_un_mapped_time_ = VLM_REC_trend_un_mapped_time.astype(np.float32)
-    gia_mean = GIA_VLM_int_rsl_mean_mapped_time.astype(np.float32)
-    gia_sterr = GIA_VLM_int_rsl_sterr_mapped_time.astype(np.float32)
-    grw = VLM_GRW_trend_un_mapped_interp.T.astype(np.float32)
-    WEIGHTS_ = WEIGHTS.T.astype(np.float32)
-    one_minus_weights = (WEIGHTS_ * -1.0) + 1.0  # shape (H, W)
-    # Simple batch loop
-    for start in range(0, nsamps, chunksize):
-        end = min(start + chunksize, nsamps)
-        # b = end - start
-        # shape (b, 1, 1) so broadcasting works with (H,W) arrays
-        r1 = norm_inv_perm[start:end][:, None, None]
-        r2 = norm_inv_perm2[start:end][:, None, None]
-        # Broadcasted arithmetic -> shapes (b, H, W)
-        VLM_obs_batch = WEIGHTS_[None, :, :] * (
-            VLM_REC_trend_mapped_time_[None, :, :]
-            + VLM_REC_trend_un_mapped_time_[None, :, :] * r1
-            + grw[None, :, :] * r2
-        )
-        # GIA_sample = (1 - WEIGHTS) * (gia_mean + gia_sterr*r1)
-        GIA_batch = one_minus_weights[None, :, :] * (
-            gia_mean[None, :, :] + gia_sterr[None, :, :] * r1
-        )
-        # final samples: round then cast once
-        VLM_batch = np.around(VLM_obs_batch + GIA_batch).astype(np.int16)
-        SAMPLES[start:end, :, :] = VLM_batch
-        # print(start)
-
-    ncvar_attributes = {
-        "description": "Global VLM contributions to RSL change according to Global vlm workflow",
-        "history": "Created " + time.ctime(time.time()),
-        "source": "SLR Framework: Global vlm workflow",
-        "scenario": "NA",
-        "baseyear": baseyear,
-    }
-
-    vlm_out = xr.Dataset(
-        {
-            "sea_level_change": (
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".vlm-", suffix=".nc", dir=output.parent)
+    os.close(fd)
+    try:
+        with Dataset(temporary, "w") as nc:
+            for name, size in [
+                ("samples", nsamps),
+                ("years", len(years)),
+                ("locations", len(ids)),
+            ]:
+                nc.createDimension(name, size)
+            for name, data, dtype, dim in [
+                ("samples", np.arange(nsamps), "i8", "samples"),
+                ("years", years, "f8", "years"),
+                ("locations", ids, "i8", "locations"),
+                ("lat", lats, "f8", "locations"),
+                ("lon", lons, "f8", "locations"),
+            ]:
+                options = {"fill_value": np.nan} if dtype == "f8" else {}
+                nc.createVariable(name, dtype, (dim,), **options)[:] = data
+            nc.setncatts(
+                {
+                    "description": (
+                        "GIA contributions to RSL change"
+                        if gia_only
+                        else "Global VLM contributions to RSL change according to Global vlm workflow"
+                    ),
+                    "history": "Created " + time.ctime(),
+                    "source": "SLR Framework: Global vlm workflow",
+                    "scenario": "NA",
+                    "baseyear": baseyear,
+                    "vlm_rate_mode": "gia-only" if gia_only else rate_mode,
+                }
+            )
+            var = nc.createVariable(
+                "sea_level_change",
+                "f4",
                 ("samples", "years", "locations"),
-                SAMPLES,
-                {"units": "mm", "missing_value": nc_missing_value},
-            ),
-            "lat": (("locations"), site_lats),
-            "lon": (("locations"), site_lons),
-        },
-        coords={
-            "years": targyears,
-            "locations": site_ids,
-            "samples": np.arange(nsamps),
-        },
-        attrs=ncvar_attributes,
-    )
-    # Write the netcdf output file
-    vlm_out.to_netcdf(
-        output_lslr_file,
-        encoding={
-            "sea_level_change": {
-                "dtype": "f4",
-                "zlib": True,
-                "complevel": 4,
-                "_FillValue": nc_missing_value,
-            }
-        },
-    )
-    return None
-
-
-if __name__ == "__main__":
-    # Initialize the command-line argument parser
-    parser = argparse.ArgumentParser(
-        description="Run the post-processing stage for the oelsmann24 vertical land motion workflow",
-        epilog="Note: This is meant to be run as part of the oelsmann24 module within the Framework for the Assessment of Changes To Sea-level (FACTS)",
-    )
-
-    # Define the command line arguments to be expected
-    parser.add_argument(
-        "--nsamps", help="Number of samples to generate", default=20000, type=int
-    )
-    parser.add_argument(
-        "--seed", help="Seed value for random number generator", default=1234, type=int
-    )
-    parser.add_argument(
-        "--baseyear",
-        help="Base or reference year for projetions [default=2000]",
-        default=2005,
-        type=int,
-    )
-    parser.add_argument(
-        "--pyear_start",
-        help="Year for which projections start [default=2000]",
-        default=2020,
-        type=int,
-    )
-    parser.add_argument(
-        "--pyear_end",
-        help="Year for which projections end [default=2100]",
-        default=2150,
-        type=int,
-    )
-    parser.add_argument(
-        "--pyear_step",
-        help="Step size in years between pyear_start and pyear_end at which projections are produced [default=10]",
-        default=10,
-        type=int,
-    )
-    parser.add_argument(
-        "--locationfile",
-        help="File that contains name, id, lat, and lon of points for localization",
-        default="location.lst",
-    )
-    parser.add_argument(
-        "--chunksize",
-        help="Number of locations to process at a time [default=50]",
-        type=int,
-        default=100,
-    )
-    parser.add_argument(
-        "--pipeline_id", help="Unique identifier for this instance of the module"
-    )
-
-    # Parse the arguments
-    args = parser.parse_args()
-
-    # Make sure the base year and target years are within data limits for this module
-    if args.baseyear < 2000:
-        raise Exception(
-            "Base year cannot be less than year 2000: baseyear = {}".format(
-                args.baseyear
+                zlib=True,
+                complevel=4,
+                fill_value=np.nan,
+                chunksizes=(sample_block, len(years), location_block),
             )
-        )
-    if args.baseyear > 2300:
-        raise Exception(
-            "Base year cannot be greater than year 2300: baseyear = {}".format(
-                args.baseyear
-            )
-        )
-    if args.pyear_start < 2000:
-        raise Exception(
-            "Projection year cannot be less than year 2000: pyear_start = {}".format(
-                args.pyear_start
-            )
-        )
-    if args.pyear_end > 2300:
-        raise Exception(
-            "Projection year cannot be greater than year 2300: pyear_end = {}".format(
-                args.pyear_end
-            )
-        )
-
-    # Make sure the target year stepping is positive
-    if args.pyear_step < 1:
-        raise Exception(
-            "Projection year step must be greater than 0: pyear_step = {}".format(
-                args.pyear_step
-            )
-        )
-
-    # Run the postprocessing stage
-    vlm_postprocess(
-        args.nsamps,
-        args.seed,
-        args.locationfile,
-        args.baseyear,
-        args.pyear_start,
-        args.pyear_end,
-        args.pyear_step,
-        args.chunksize,
-        args.pipeline_id,
-    )
-
-    # Done
-    exit()
+            var.setncatts({"units": "mm", "missing_value": np.float32(np.nan)})
+            mean, obs, grw, gia = coefficients
+            for loc in range(0, len(ids), location_block):
+                sl = slice(loc, loc + location_block)
+                for start in range(0, nsamps, sample_block):
+                    stop = min(nsamps, start + sample_block)
+                    block = mean[None, :, sl] + sum(
+                        coefficient[None, :, sl] * draw[start:stop, None, None]
+                        for coefficient, draw in zip([obs, grw, gia], draws)
+                    )
+                    var[start:stop, :, sl] = block.astype(np.float32)
+        os.replace(temporary, output)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)

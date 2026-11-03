@@ -1,7 +1,5 @@
 import numpy as np
 import xarray as xr
-import math
-import argparse
 from scipy.spatial import cKDTree
 from typing import Optional, Tuple
 import copy
@@ -40,6 +38,11 @@ def _to_xyz(lon_deg, lat_deg):
     np.ndarray of shape (N, 3)
         Unit vectors (x, y, z) on the sphere.
     """
+    lon_deg, lat_deg = np.broadcast_arrays(lon_deg, lat_deg)
+    if not np.all(np.isfinite(lon_deg) & np.isfinite(lat_deg)):
+        raise ValueError("Coordinates must be finite")
+    if np.any(np.abs(lat_deg) > 90):
+        raise ValueError("Latitudes must be between -90 and 90 degrees")
     lon = np.deg2rad(lon_deg)
     lat = np.deg2rad(lat_deg)
     cl = np.cos(lat)
@@ -77,6 +80,8 @@ def _kernel_weights(dist_km, L_km, kernel="cos", exponent=1.0):
     np.ndarray
         Weights aligned with `dist_km`.
     """
+    if not np.isfinite(L_km) or L_km <= 0 or not np.isfinite(exponent) or exponent <= 0:
+        raise ValueError("Kernel scale and exponent must be finite and positive")
     d = np.asarray(dist_km)
     w = np.zeros_like(d, dtype=float)
 
@@ -150,7 +155,10 @@ def radial_smoothing(
     tree = cKDTree(xyz)
 
     # Radius in chord space for neighbor search
-    arc = L_km / EARTH_RADIUS_KM
+    if min_neighbors < 1:
+        raise ValueError("min_neighbors must be positive")
+    _kernel_weights(np.array([0.0]), L_km, kernel, exponent)
+    arc = min((3 if kernel == "gaussian" else 1) * L_km / EARTH_RADIUS_KM, np.pi)
     chord_radius = 2.0 * np.sin(arc / 2.0)
 
     y_s = np.full_like(y, np.nan, dtype=float)
@@ -175,7 +183,7 @@ def radial_smoothing(
 
         # Exclude NaNs and zero weights
         valid = np.isfinite(y[idxs]) & (w > 0)
-        if not np.any(valid):
+        if np.count_nonzero(valid) < min_neighbors:
             continue
 
         wv = w[valid]
@@ -188,7 +196,12 @@ def radial_smoothing(
 
         # Weighted standard deviation of neighbors
         # sqrt( sum(w*(x-mu)^2) / sum(w) )
-        y_s_un[i] = np.sqrt(np.sum(wv * (yv - ybar) ** 2) / wsum)
+        variance = np.sum(wv * (yv - ybar) ** 2) / wsum
+        if w_unc is not None:
+            # Independent measurement error of the weighted mean, plus unresolved
+            # spatial scatter. An isolated station retains its reported error.
+            variance += np.sum((wv / wsum) ** 2 * sigma[idxs][valid] ** 2)
+        y_s_un[i] = np.sqrt(variance)
 
     # Package outputs
     out = ds.copy()
@@ -211,12 +224,12 @@ def radial_smoothing(
         dims=(dim,),
         coords=base_coords,
         attrs={
-            "description": f"Weighted standard deviation of neighbors for {var_name}_s",
+            "description": f"Propagated measurement error plus spatial scatter for {var_name}_s",
             "L_km": L_km,
             "kernel": kernel,
             "exponent": exponent,
             "uncert_weighting": used_uncert,
-            "formula": "sqrt(sum(w*(x-mu)^2)/sum(w)) with w = decay * (1/sigma^2)",
+            "formula": "sqrt(sum(a*(x-mu)^2) + sum(a^2*sigma^2)); a=w/sum(w)",
         },
     )
     return out
@@ -441,11 +454,12 @@ def haversine(coord1, coord2):
     dphi = np.radians(lat2 - lat1)
     dlambda = np.radians(lon2 - lon1)
 
-    a = np.sin(dphi / 2) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlambda / 2) ** 2
-    if str(type(a)) == "<class 'numpy.float64'>":
-        return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    else:
-        return 2 * R * np.arctan(np.sqrt(a), np.sqrt(1 - a))
+    a = np.clip(
+        np.sin(dphi / 2) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlambda / 2) ** 2,
+        0,
+        1,
+    )
+    return 2 * R * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
 
 
 def compute_dist_between_datasets(data1, data2):
@@ -459,24 +473,11 @@ def compute_dist_between_datasets(data1, data2):
         - ids_  : indices into `data2` for nearest neighbors
         - dist_ : distances (meters) to those neighbors
     """
-    lon_a = data1.lon.values
-    lat_a = data1.lat.values
-
-    lon_data = data2.lon.values
-    lat_data = data2.lat.values
-
-    ids_ = np.empty([len(lat_a)]) * 0
-    dist_ = np.empty([len(lat_a)]) * 0
-    coord2 = [lat_data, lon_data]
-    i = 0
-    for lond, latd in zip(lon_a, lat_a):
-        coord = (latd, lond)
-        dist = haversine(coord, coord2)
-        arg_ = np.argmin(dist)
-        ids_[i] = arg_
-        dist_[i] = dist[arg_]
-        i = i + 1
-    return ids_, dist_
+    if data2.lon.size == 0:
+        raise ValueError("Cannot find neighbors in an empty source dataset")
+    tree = cKDTree(_to_xyz(data2.lon.values, data2.lat.values))
+    chord, ids_ = tree.query(_to_xyz(data1.lon.values, data1.lat.values))
+    return ids_, _arc_km_from_chord(chord) * 1000
 
 
 def flatten_lon_lat(datain, name="sla", time=True):
@@ -496,13 +497,15 @@ def flatten_lon_lat(datain, name="sla", time=True):
     xr.Dataset
     """
     lon, lat = np.meshgrid(datain.lon, datain.lat)
-    flat_x = datain.values.flatten()
+    flat_x = datain.transpose(
+        *(["time", "lat", "lon"] if time else ["lat", "lon"])
+    ).values
     coords = {"lon": (["x"], lon.flatten()), "lat": (["x"], lat.flatten())}
     if time:
         coords["time"] = datain.time.values
-        var_dict = {name: (["time", "x"], flat_x)}
+        var_dict = {name: (["time", "x"], flat_x.reshape(datain.sizes["time"], -1))}
     else:
-        var_dict = {name: (["x"], flat_x)}
+        var_dict = {name: (["x"], flat_x.ravel())}
 
     ds = xr.Dataset(var_dict, coords=coords)
     return ds
@@ -525,21 +528,14 @@ def merge_gps_and_vlm_reconstruction(VLM_REC, GPS_VLM):
     - all units are in m/year or m
     """
 
-    # match GPS and VLM_REC locations
-    ids_short, ids_other, dist_km, short_is_a = couple_short(
-        GPS_VLM.x,
-        VLM_REC.x,
-        dim="x",
-        lon_name="lon",
-        lat_name="lat",
-        id_coord_a="ID",  # or None to use row indices
-        id_coord_b="ID",  # adapt to your coord names
-        limit_km=100.0,
-        return_distance=True,
-    )
+    VLM_REC = VLM_REC.assign_coords(lon=(VLM_REC.lon + 180) % 360 - 180).copy()
+    GPS_VLM = GPS_VLM.assign_coords(lon=(GPS_VLM.lon + 180) % 360 - 180).copy()
+    VLM_REC = VLM_REC.drop_vars("x", errors="ignore")
+    GPS_VLM = GPS_VLM.drop_vars("x", errors="ignore")
+    _, distances = compute_dist_between_datasets(GPS_VLM, VLM_REC)
 
     # select GPS at locations not covered by the reconstruction
-    GPS_VLM_sub = GPS_VLM.isel({"x": np.isnan(ids_other)})[
+    GPS_VLM_sub = GPS_VLM.isel({"x": distances > 100000})[
         ["trend", "trend_un", "trend_CMR_corrected"]
     ]
     GPS_select = [
@@ -601,7 +597,7 @@ def merge_gps_and_vlm_reconstruction(VLM_REC, GPS_VLM):
     smoothed["lon"][:] = np.round(smoothed["lon"] * 4) / 4
     smoothed["lat"][:] = np.round(smoothed["lat"] * 4) / 4
     smoothed = (
-        smoothed.drop({"x"}).rename(
+        smoothed.drop_vars("x", errors="ignore").rename(
             {
                 "trend_s": "VLM_trend_coefficient_mean",
                 "trend_s_un": "VLM_trend_coefficient_uncertainty",
@@ -665,89 +661,140 @@ def merge_gps_and_vlm_reconstruction(VLM_REC, GPS_VLM):
     return VLM_REC_MERGED, VLM_REC_MERGED_GRW
 
 
+def normalize_grid(ds):
+    """Sort a rectilinear grid and normalize its longitude seam without mutation."""
+    if "lon" not in ds.coords or "lat" not in ds.coords:
+        raise ValueError("Grid requires lon and lat coordinates")
+    _to_xyz(ds.lon.values, np.zeros(ds.lon.size))
+    if not np.all(np.isfinite(ds.lat)) or np.any(abs(ds.lat) > 90):
+        raise ValueError("Invalid latitude coordinates")
+    ds = ds.assign_coords(lon=(ds.lon + 180) % 360 - 180).sortby("lon").sortby("lat")
+    _, idx = np.unique(ds.lon.values, return_index=True)
+    ds = ds.isel(lon=np.sort(idx))
+    if np.unique(ds.lat).size != ds.lat.size:
+        raise ValueError("Duplicate latitude coordinates")
+    return ds
+
+
+def periodic_interp(ds, lat, lon):
+    """Interpolate across the longitude seam; latitude extrapolation only at poles."""
+    ds = normalize_grid(ds)
+    lon = (np.asarray(lon) + 180) % 360 - 180
+    if ds.lon.size < 2 or ds.lat.size < 2:
+        raise ValueError("Input grids require at least two latitudes and longitudes")
+    # Extend only global grids. Regional inputs must cover their requested domain.
+    spacing = float(np.median(np.diff(ds.lon.values)))
+    if (
+        float(ds.lon.max() - ds.lon.min()) >= 180
+        and 360 - float(ds.lon.max() - ds.lon.min()) <= 2 * spacing
+    ):
+        ds = xr.concat(
+            [
+                ds.isel(lon=[-1]).assign_coords(lon=ds.lon.values[-1:] - 360),
+                ds,
+                ds.isel(lon=[0]).assign_coords(lon=ds.lon.values[:1] + 360),
+            ],
+            dim="lon",
+        )
+    if np.min(lon) < float(ds.lon.min()) or np.max(lon) > float(ds.lon.max()):
+        raise ValueError("Input grid does not cover requested longitudes")
+    lat_step = float(np.median(np.diff(ds.lat.values)))
+    if (
+        np.min(lat) < float(ds.lat.min()) - lat_step
+        or np.max(lat) > float(ds.lat.max()) + lat_step
+    ):
+        raise ValueError("Input grid does not cover requested latitudes")
+    return ds.interp(lat=lat, lon=lon, kwargs={"fill_value": "extrapolate"})
+
+
+def _validate_gia_rates(gia, names):
+    """Validate rate units and uncertainty for both blended and GIA-only runs."""
+    for name in names:
+        declared = gia[name].attrs.get("units", gia[name].attrs.get("unit", "mm/yr"))
+        if declared.lower().replace(" ", "") not in {"mm/yr", "mm/year", "mmyr-1"}:
+            raise ValueError(f"GIA {name} must be in mm/year")
+    if np.any(gia.rsl_sterr < 0):
+        raise ValueError("GIA standard errors cannot be negative")
+
+
+def _interpolate_gia(gia, include_radial=True):
+    """Use the same quarter-degree GIA grid for both projection paths."""
+    gia = periodic_interp(
+        gia, np.arange(-90, 90, 0.25), np.arange(-180, 180, 0.25)
+    ).transpose("lat", "lon")
+    names = ["rsl_mean", "rsl_sterr"] + (["rad_mean"] if include_radial else [])
+    for name in names:
+        if not np.all(np.isfinite(gia[name])):
+            raise ValueError(f"GIA {name} contains missing values after interpolation")
+    if include_radial:
+        gia["asl"] = gia.rsl_mean + gia.rad_mean
+    return gia
+
+
+def preprocess_gia_only(input_gia_vlm_file):
+    """Load only GIA RSL means/errors, bypassing all observational input data."""
+    names = ["rsl_mean", "rsl_sterr"]
+    with xr.open_dataset(input_gia_vlm_file) as source:
+        absent = set(names) - set(source)
+        if absent:
+            raise ValueError(
+                f"{input_gia_vlm_file}: missing variables {sorted(absent)}"
+            )
+        gia = source[names].load()
+    for name in names:
+        if set(gia[name].dims) != {"lat", "lon"}:
+            raise ValueError(f"GIA {name} must have lat and lon dimensions")
+    _validate_gia_rates(gia, names)
+    return {"GIA_VLM_int": _interpolate_gia(gia, include_radial=False)}
+
+
 def interpolate_and_compute_weights(
     VLM_REC_MERGED, VLM_REC_MERGED_GRW, GIA_VLM, dist2coast
 ):
+    """Prepare spatial fields, retaining GRW only at source sites with actual dates.
+
+    A source_index grid replaces the former global space-by-time GRW cube. Site
+    extraction happens before temporal interpolation in postprocessing.
     """
-    Interpolate to the target projection grid and compute weights/masks.
-
-    Returns
-    -------
-    (xr.Dataset, xr.Dataset, xr.DataArray, xr.DataArray)
-        - GIA_VLM_int : GIA fields interpolated to target grid (+ 'asl')
-        - dis_sel_2d  : structured grid with VLM trend/uncertainty and ancillary fields
-        - dis_sel_2d_grw_use : GRW ensemble std (selected years) on grid
-        - w_d         : weight mask blending GPS+recon vs GIA by coastal distance
-    """
-
-    lon_grid = np.arange((360 * 4)) / 4 - 180
-    lat_grid = np.arange((180 * 4)) / 4 - 90
-
-    distance_max = 150
-    lon_ext = dist2coast["lon"].values
-    lon_ext[lon_ext > 180] = lon_ext[lon_ext > 180] - 360
-    dist2coast.assign_coords(lon=dist2coast.lon * 0 + lon_ext)
-
-    # interpolate to the same grid used in the projections
-    dist2coast_int = dist2coast["z"][::10, ::11].interp(lat=lat_grid, lon=lon_grid)
-    dist2coast_int_flat = flatten_lon_lat(dist2coast_int, name="z", time=False)
-    dis_sel = dist2coast_int_flat["z"][abs(dist2coast_int_flat["z"]) < distance_max]
-    dis_sel = dis_sel.to_dataset()
-
-    # compute distances to match VLM_REC_MERGED with dis_sel
-    ids_, dist_ = compute_dist_between_datasets(dis_sel, VLM_REC_MERGED)
-
-    VLM_REC_MERGED_large = VLM_REC_MERGED.isel({"x": ids_.astype(int)})
-    VLM_REC_MERGED_GRW_large_GRW = VLM_REC_MERGED_GRW.isel({"x": ids_.astype(int)})
-
-    variables = ["VLM_trend_coefficient_mean", "VLM_trend_coefficient_uncertainty"]
-    for var in variables:
-        dis_sel[var] = copy.deepcopy(dis_sel["z"])
-        dis_sel[var][:] = VLM_REC_MERGED_large[var].values
-    var = "distance"
-    dis_sel[var] = copy.deepcopy(dis_sel["z"])
-    dis_sel[var][:] = dist_
-    variables = ["VLM_trend_coefficient_mean", "VLM_trend_coefficient_uncertainty"] + [
-        "distance",
-        "z",
-    ]
-    dis_sel_2d, ids_2 = regrid_from_flat(dis_sel, variables, lon_grid, lat_grid)
-    dis_sel_2d_grw = make_grw_grid(VLM_REC_MERGED_GRW_large_GRW, dis_sel_2d, ids_2)
-
-    # select from year 25 because dis_sel_2d_grw['GRW_ensemble_std'] is zero before year 25
-    dis_sel_2d_grw_use = xr.concat(
-        [
-            dis_sel_2d_grw["GRW_ensemble_std"][:, :, 0:1] * 0,
-            dis_sel_2d_grw["GRW_ensemble_std"][:, :, 25::5],
-            dis_sel_2d_grw["GRW_ensemble_std"][:, :, 25::5] * 0,
-        ],
-        dim="time",
-    ).fillna(0)
-    dist_thresh = 100000  # m
-    # w_d contains weights == 1, where GPS and the VLM reconstruction is used, and == 0, where GIA data is used
-    w_d = (
-        (dis_sel_2d["distance"] < dist_thresh)
-        * 1
-        * (
-            (np.cos(dis_sel_2d["distance"].values * 2 * np.pi / (2 * dist_thresh)) + 1)
-            / 2
-        )
-    )  # (dis_sel_2d['distance']*-1+dist_thresh)/dist_thresh
-    w_d = w_d.fillna(0)
-
-    lon_prt = GIA_VLM["lon"].values
-    lon_prt[lon_prt > 180] = lon_prt[lon_prt > 180] - 360
-    GIA_VLM["lon"] = lon_prt
-
-    GIA_VLM_int = GIA_VLM.interp(lat=lat_grid, lon=lon_grid)
-    GIA_VLM_int = GIA_VLM_int.interpolate_na(
-        dim="lat", method="linear", fill_value="extrapolate"
-    ).interpolate_na(dim="lon", method="linear", fill_value="extrapolate")
-    GIA_VLM_int["asl"] = (
-        GIA_VLM_int["rsl_mean"] + GIA_VLM_int["rad_mean"]
-    )  # The contribution of GIA to RSL without the radial deformation (that is not captured by VLM observations)
-
-    return GIA_VLM_int, dis_sel_2d, dis_sel_2d_grw_use, w_d
+    lon_grid = np.arange(-180, 180, 0.25)
+    lat_grid = np.arange(-90, 90, 0.25)
+    # Keep the established lightweight coastal-grid decimation, but normalize the
+    # seam before interpolation. Source native coordinate resolution may vary.
+    coast = dist2coast["z"].transpose("lat", "lon")
+    coast = periodic_interp(coast, lat_grid, lon_grid).transpose("lat", "lon")
+    selected = np.isfinite(coast.values) & (abs(coast.values) < 150)
+    rows, cols = np.nonzero(selected)
+    sites = xr.Dataset(
+        coords={"lon": ("x", lon_grid[cols]), "lat": ("x", lat_grid[rows])}
+    )
+    if VLM_REC_MERGED.sizes["x"]:
+        ids, distances = compute_dist_between_datasets(sites, VLM_REC_MERGED)
+    else:
+        # All observations may have been excluded by the established masks.
+        rows, cols = np.array([], dtype=int), np.array([], dtype=int)
+        ids, distances = np.array([], dtype=int), np.array([])
+    coords = {"lat": lat_grid, "lon": lon_grid}
+    shape = selected.shape
+    spatial = xr.Dataset(coords=coords)
+    for name in ["VLM_trend_coefficient_mean", "VLM_trend_coefficient_uncertainty"]:
+        values = np.full(shape, np.nan)
+        values[rows, cols] = VLM_REC_MERGED[name].values[ids]
+        spatial[name] = (("lat", "lon"), values)
+    d = np.full(shape, np.nan)
+    d[rows, cols] = distances
+    spatial["distance"] = (("lat", "lon"), d)
+    spatial["z"] = coast
+    source_index = np.full(shape, -1, dtype=np.int32)
+    source_index[rows, cols] = ids
+    spatial["source_index"] = (("lat", "lon"), source_index)
+    weights = xr.where(
+        np.isfinite(spatial.distance) & (spatial.distance < 100000),
+        (np.cos(np.pi * spatial.distance / 100000) + 1) / 2,
+        0,
+    )
+    gia = _interpolate_gia(GIA_VLM)
+    grw = VLM_REC_MERGED_GRW["GRW_ensemble_std"].transpose("x", "time")
+    return gia, spatial, grw, weights
 
 
 def load_datasets(
@@ -765,26 +812,93 @@ def load_datasets(
     (VLM_REC, GPS_VLM, GIA_VLM, dist2coast, example) : tuple of xr.Dataset
     """
 
-    VLM_REC = xr.open_dataset(
+    paths = [
         input_vlm_reconstruction_file,
-        # os.path.join(os.path.dirname(__file__), "data/VLM_reconstruction.nc")
-    )
-    GPS_VLM = xr.open_dataset(
         input_gps_vlm_file,
-        # os.path.join(os.path.dirname(__file__), "data/NGL14_CMR_corrected.nc")
-    )
-    GIA_VLM = xr.open_dataset(
         input_gia_vlm_file,
-        # os.path.join(os.path.dirname(__file__), "data/GIA_stats.nc")
-    )
-    dist2coast = xr.open_dataset(
         input_dist2coast_file,
-        # os.path.join(os.path.dirname(__file__), "data/dist2coast_1deg_v2.grd")
-    ).rename({"x": "lon", "y": "lat"})
-    example = xr.open_dataset(
         input_example_file,
-        # os.path.join(os.path.dirname(__file__), "data/ssp585.2150.fair2.emuGLA.emulandice2.glaciers_quantiles.nc")
-    )
+    ]
+    datasets = []
+    # Load only necessary variables, closing every input handle before computation.
+    required = [
+        [
+            "VLM_trend_coefficient_mean",
+            "VLM_trend_coefficient_uncertainty",
+            "GRW_ensemble_std",
+        ],
+        ["trend", "trend_un", "trend_CMR_corrected"],
+        ["rsl_mean", "rsl_sterr", "rad_mean"],
+        ["z"],
+        [],
+    ]
+    for path, names in zip(paths, required):
+        with xr.open_dataset(path) as source:
+            absent = set(names) - set(source)
+            if absent:
+                raise ValueError(f"{path}: missing variables {sorted(absent)}")
+            if "z" in names:
+                source = source.rename(
+                    {
+                        k: v
+                        for k, v in {"x": "lon", "y": "lat"}.items()
+                        if k in source.dims
+                    }
+                )
+                # Do not read the multi-GB native coastal raster into memory.
+                lat_stride = max(
+                    1, round(0.1 / float(np.median(abs(np.diff(source.lat)))))
+                )
+                lon_stride = max(
+                    1, round(0.11 / float(np.median(abs(np.diff(source.lon)))))
+                )
+                source = source.isel(
+                    lat=slice(None, None, lat_stride), lon=slice(None, None, lon_stride)
+                )
+            datasets.append(
+                source[names].load() if names else xr.Dataset(attrs=dict(source.attrs))
+            )
+    VLM_REC, GPS_VLM, GIA_VLM, dist2coast, example = datasets
+    for ds, mean, sigma, unit in [
+        (
+            VLM_REC,
+            "VLM_trend_coefficient_mean",
+            "VLM_trend_coefficient_uncertainty",
+            "m/year",
+        ),
+        (GPS_VLM, "trend_CMR_corrected", "trend_un", "mm/year"),
+    ]:
+        if ds[mean].dims != ("x",) or ds[sigma].dims != ("x",):
+            raise ValueError(f"{mean} and {sigma} must be one-dimensional on x")
+        _to_xyz(ds.lon.values, ds.lat.values)
+        if np.any(ds[sigma].values < 0):
+            raise ValueError(f"{sigma} cannot be negative")
+        valid = np.isfinite(ds[mean]) & np.isfinite(ds[sigma])
+        if not bool(valid.all()):
+            logger.warning(
+                "Dropping %d sites missing %s or its uncertainty",
+                int((~valid).sum()),
+                mean,
+            )
+        filtered = ds.isel(x=valid)
+        if ds is VLM_REC:
+            VLM_REC = filtered
+        else:
+            GPS_VLM = filtered
+        for var in [mean, sigma]:
+            declared = ds[var].attrs.get("units", unit).lower().replace(" ", "")
+            accepted = (
+                {"m/year", "m/yr", "myr-1"}
+                if unit == "m/year"
+                else {"mm/year", "mm/yr", "mmyr-1"}
+            )
+            if declared not in accepted:
+                raise ValueError(f"{var}: expected {unit}, got {declared}")
+    if VLM_REC.sizes["x"] == 0:
+        raise ValueError("Reconstruction contains no valid sites")
+    if VLM_REC.GRW_ensemble_std.attrs.get("units", "m") != "m":
+        raise ValueError("GRW_ensemble_std must contain displacement in metres")
+    _validate_gia_rates(GIA_VLM, ["rsl_mean", "rsl_sterr", "rad_mean"])
     return VLM_REC, GPS_VLM, GIA_VLM, dist2coast, example
 
 
@@ -843,31 +957,4 @@ def global_preprocess_verticallandmotion(
         "example": example,
     }
 
-    # Define the data directory
-    # outdir = os.path.dirname(__file__)
-
-    # Write the rates data to a pickle file
-    # outfile = open(os.path.join(outdir, "{}_data.pkl".format(pipeline_id)), 'wb')
-    # p.dump(outdata, outfile)
-    # outfile.close()
     return outdata
-
-
-if __name__ == "__main__":
-    # Initialize the command-line argument parser
-    parser = argparse.ArgumentParser(
-        description="Run the pre-processing stage for the global vertical land motion workflow",
-        epilog="Note: This is meant to be run as part of the oelsmann24 module within the Framework for the Assessment of Changes To Sea-level (FACTS)",
-    )
-    parser.add_argument(
-        "--pipeline_id", help="Unique identifier for this instance of the module"
-    )
-
-    # Parse the arguments
-    args = parser.parse_args()
-
-    # Run the preprocessing stage
-    global_preprocess_verticallandmotion(args.pipeline_id)
-
-    # Done
-    exit()

@@ -4,4 +4,7 @@ format:
 lint:
 	uv run ruff check --fix
 
-validate: format lint
+test:
+	uv run pytest
+
+validate: format lint test

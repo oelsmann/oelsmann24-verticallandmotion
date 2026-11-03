@@ -1,5 +1,4 @@
 import numpy as np
-import re
 
 """ read_locationfile.py
 
@@ -18,19 +17,36 @@ def ReadLocationFile(location_file):
     lats = []
     lons = []
 
-    # Compile the regex for finding commented lines
-    comment_regex = re.compile(r"^#")
-
     # Open the rate file
     with open(location_file, "r") as f:
         # Loop over the lines of the file
-        for line in f:
+        for number, line in enumerate(f, 1):
             # Skip commented lines
-            if re.search(comment_regex, line):
+            if not line.strip() or line.lstrip().startswith("#"):
                 continue
 
             # Split the line into components
-            (this_name, this_id, this_lat, this_lon) = line.split("\t")
+            try:
+                (this_name, this_id, this_lat, this_lon) = line.strip().split("\t")
+                this_id, this_lat, this_lon = (
+                    int(this_id),
+                    float(this_lat),
+                    float(this_lon),
+                )
+                if not this_name or this_id in ids:
+                    raise ValueError("Site names must be nonempty and IDs unique")
+                if (
+                    not np.isfinite(this_lat)
+                    or abs(this_lat) > 90
+                    or not np.isfinite(this_lon)
+                ):
+                    raise ValueError(
+                        "Coordinates must be finite and latitude in -90..90"
+                    )
+                if not -180 <= this_lon <= 360:
+                    raise ValueError("Longitude must use -180..180 or 0..360 degrees")
+            except ValueError as exc:
+                raise ValueError(f"{location_file}: line {number}: {exc}") from exc
 
             # Store the information
             names.append(this_name)
@@ -38,6 +54,8 @@ def ReadLocationFile(location_file):
             lats.append(float(this_lat))
             lons.append(float(this_lon))
 
+    if not ids:
+        raise ValueError(f"{location_file}: no locations found")
     # Cast everything as numpy arrays
     names = np.array(names)
     ids = np.array(ids)
